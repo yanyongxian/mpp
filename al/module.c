@@ -29,6 +29,21 @@ struct _MppModule {
 
 #define FIND_PLUGIN(TYPE, type, name)                                                                          \
     S32 find_##type##_plugin(U8 *path) {                                                                       \
+        {                                                                                                      \
+            const char *plugin_dir = getenv("MPP_PLUGIN_DIR");                                                \
+            if (plugin_dir) {                                                                                  \
+                char override_path[MAX_PATH_LENGTH];                                                           \
+                snprintf(override_path, sizeof(override_path), "%s/lib" #name ".so", plugin_dir);            \
+                if (0 == access(override_path, F_OK)) {                                                        \
+                    debug("found " #name " plugin in MPP_PLUGIN_DIR: %s", override_path);                     \
+                    S32 len = strlen(override_path);                                                           \
+                    memcpy(path, override_path, len);                                                         \
+                    path[len] = '\0';                                                                         \
+                    return 1;                                                                                  \
+                }                                                                                              \
+            }                                                                                                  \
+        }                                                                                                      \
+                                                                                                               \
         if (0 == access("/usr/lib/lib" #name ".so", F_OK)) {                                                   \
             debug("yeah! we have " #name " plugin---------------");                                            \
             char *tmp = "/usr/lib/lib" #name ".so";                                                            \
