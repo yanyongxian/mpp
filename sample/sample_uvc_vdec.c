@@ -37,15 +37,15 @@
 
 /* ======================== Config ======================== */
 
-#define SAMPLE_WIDTH 1280
-#define SAMPLE_HEIGHT 720
-#define SAMPLE_FPS 30
-#define SAMPLE_SAVE_COUNT 20  /* number of decoded frames to save */
 #define SAMPLE_WARMUP_COUNT 2 /* discard initial frames (manual mode) */
 
 static const char *g_devNode = "/dev/video0";
 static const char *g_outDir = "./nv12_output";
 static S32 g_bindMode = 0; /* 0 = manual, 1 = bind */
+static U32 g_width = 1280;
+static U32 g_height = 720;
+static U32 g_fps = 30;
+static U32 g_saveCount = 20;
 
 static volatile S32 g_running = 1;
 
@@ -155,10 +155,10 @@ static S32 run_uvc_vdec_manual(void) {
     UVC_CHN uvcChn = 0;
     UvcChnAttr uvcChnAttr;
     memset(&uvcChnAttr, 0, sizeof(uvcChnAttr));
-    uvcChnAttr.u32Width = SAMPLE_WIDTH;
-    uvcChnAttr.u32Height = SAMPLE_HEIGHT;
+    uvcChnAttr.u32Width = g_width;
+    uvcChnAttr.u32Height = g_height;
     uvcChnAttr.ePixelFormat = MPP_PIXEL_FORMAT_MJPEG;
-    uvcChnAttr.u32Fps = SAMPLE_FPS;
+    uvcChnAttr.u32Fps = g_fps;
     uvcChnAttr.u32Depth = 1;
 
     ret = UVC_SetChnAttr(uvcDev, uvcChn, &uvcChnAttr);
@@ -176,8 +176,8 @@ static S32 run_uvc_vdec_manual(void) {
     memset(&vdecAttr, 0, sizeof(vdecAttr));
     vdecAttr.eCodecType = MPP_STREAM_CODEC_MJPEG;
     vdecAttr.eOutputPixelFormat = MPP_PIXEL_FORMAT_NV12;
-    vdecAttr.u32Width = SAMPLE_WIDTH;
-    vdecAttr.u32Height = SAMPLE_HEIGHT;
+    vdecAttr.u32Width = g_width;
+    vdecAttr.u32Height = g_height;
 
     ret = VDEC_CreateChn(vdecChn, &vdecAttr);
     assert(ret == 0);
@@ -201,9 +201,9 @@ static S32 run_uvc_vdec_manual(void) {
 
     /* --- Main loop: UVC → VDEC → save NV12 --- */
     U32 u32UvcSaved = 0;
-    printf("  [INFO] Capturing and decoding, will save %u frames to %s\n", SAMPLE_SAVE_COUNT, g_outDir);
+    printf("  [INFO] Capturing and decoding, will save %u frames to %s\n", g_saveCount, g_outDir);
 
-    while (g_running && u32Saved < SAMPLE_SAVE_COUNT) {
+    while (g_running && u32Saved < g_saveCount) {
         /* Get MJPEG frame from UVC */
         memset(&uvcFrame, 0, sizeof(uvcFrame));
         ret = UVC_GetFrame(uvcDev, uvcChn, &uvcFrame, 3000);
@@ -219,7 +219,7 @@ static S32 run_uvc_vdec_manual(void) {
         }
 
         /* Save raw MJPEG from UVC */
-        if (u32UvcSaved < SAMPLE_SAVE_COUNT) {
+        if (u32UvcSaved < g_saveCount) {
             save_mjpeg_frame(&uvcFrame, u32UvcSaved, g_outDir);
             u32UvcSaved++;
         }
@@ -272,7 +272,7 @@ static S32 run_uvc_vdec_manual(void) {
         VDEC_ReleaseFrame(vdecChn, decFrame.ulBufferId);
     }
 
-    printf("  [INFO] Saved %u / %u frames\n", u32Saved, SAMPLE_SAVE_COUNT);
+    printf("  [INFO] Saved %u / %u frames\n", u32Saved, g_saveCount);
 
     /* --- Teardown --- */
     VDEC_DisableChn(vdecChn);
@@ -332,10 +332,10 @@ static S32 run_uvc_vdec_bind(void) {
     UVC_CHN uvcChn = 0;
     UvcChnAttr uvcChnAttr;
     memset(&uvcChnAttr, 0, sizeof(uvcChnAttr));
-    uvcChnAttr.u32Width = SAMPLE_WIDTH;
-    uvcChnAttr.u32Height = SAMPLE_HEIGHT;
+    uvcChnAttr.u32Width = g_width;
+    uvcChnAttr.u32Height = g_height;
     uvcChnAttr.ePixelFormat = MPP_PIXEL_FORMAT_MJPEG;
-    uvcChnAttr.u32Fps = SAMPLE_FPS;
+    uvcChnAttr.u32Fps = g_fps;
     uvcChnAttr.u32Depth = 0;
 
     ret = UVC_SetChnAttr(uvcDev, uvcChn, &uvcChnAttr);
@@ -353,8 +353,8 @@ static S32 run_uvc_vdec_bind(void) {
     memset(&vdecAttr, 0, sizeof(vdecAttr));
     vdecAttr.eCodecType = MPP_STREAM_CODEC_MJPEG;
     vdecAttr.eOutputPixelFormat = MPP_PIXEL_FORMAT_NV12;
-    vdecAttr.u32Width = SAMPLE_WIDTH;
-    vdecAttr.u32Height = SAMPLE_HEIGHT;
+    vdecAttr.u32Width = g_width;
+    vdecAttr.u32Height = g_height;
 
     ret = VDEC_CreateChn(vdecChn, &vdecAttr);
     assert(ret == 0);
@@ -380,9 +380,9 @@ static S32 run_uvc_vdec_bind(void) {
     printf("  [INFO] SYS_Bind: UVC(dev=%d,chn=%d) → VDEC(chn=%d) OK\n", uvcDev, uvcChn, vdecChn);
 
     /* --- Main loop: read decoded frames from VDEC --- */
-    printf("  [INFO] Waiting for decoded frames (bind mode), will save %u to %s\n", SAMPLE_SAVE_COUNT, g_outDir);
+    printf("  [INFO] Waiting for decoded frames (bind mode), will save %u to %s\n", g_saveCount, g_outDir);
 
-    while (g_running && u32Saved < SAMPLE_SAVE_COUNT) {
+    while (g_running && u32Saved < g_saveCount) {
         VideoFrameInfo decFrame;
         memset(&decFrame, 0, sizeof(decFrame));
 
@@ -413,7 +413,7 @@ static S32 run_uvc_vdec_bind(void) {
         VDEC_ReleaseFrame(vdecChn, decFrame.ulBufferId);
     }
 
-    printf("  [INFO] Saved %u / %u frames\n", u32Saved, SAMPLE_SAVE_COUNT);
+    printf("  [INFO] Saved %u / %u frames\n", u32Saved, g_saveCount);
 
     /* --- Teardown (reverse order) --- */
     SYS_UnBind(&stSrc, &stSink);
@@ -438,11 +438,19 @@ bind_teardown_uvc_dev:
 /* ======================== Main ======================== */
 
 int main(int argc, char *argv[]) {
-    /* Parse args: [--bind] [--help] [devNode] [outDir] */
+    /* Parse args: [options] [devNode] [outDir] */
     S32 argIdx = 1;
     while (argIdx < argc && argv[argIdx][0] == '-') {
         if (strcmp(argv[argIdx], "--bind") == 0) {
             g_bindMode = 1;
+        } else if (strncmp(argv[argIdx], "--width=", 8) == 0) {
+            g_width = (U32)strtoul(argv[argIdx] + 8, NULL, 10);
+        } else if (strncmp(argv[argIdx], "--height=", 9) == 0) {
+            g_height = (U32)strtoul(argv[argIdx] + 9, NULL, 10);
+        } else if (strncmp(argv[argIdx], "--fps=", 6) == 0) {
+            g_fps = (U32)strtoul(argv[argIdx] + 6, NULL, 10);
+        } else if (strncmp(argv[argIdx], "--frames=", 9) == 0) {
+            g_saveCount = (U32)strtoul(argv[argIdx] + 9, NULL, 10);
         } else if (strcmp(argv[argIdx], "--help") == 0 || strcmp(argv[argIdx], "-h") == 0) {
             printf(
                 "Usage: %s [OPTIONS] [devNode] [outDir]\n\n"
@@ -450,6 +458,10 @@ int main(int argc, char *argv[]) {
                 "Options:\n"
                 "  --bind    Use SYS_Bind mode (UVC->VDEC automatic stream delivery).\n"
                 "            Default is manual mode (UVC_GetFrame -> VDEC_SendStream).\n"
+                "  --width=N Capture width (default: %u).\n"
+                "  --height=N Capture height (default: %u).\n"
+                "  --fps=N   Capture frame rate (default: %u).\n"
+                "  --frames=N Number of decoded frames to save (default: %u).\n"
                 "  -h,--help Show this help message.\n\n"
                 "Positional:\n"
                 "  devNode   UVC device node  (default: %s)\n"
@@ -459,6 +471,10 @@ int main(int argc, char *argv[]) {
                 "  %s --bind\n"
                 "  %s --bind /dev/video0 ./output\n",
                 argv[0],
+                g_width,
+                g_height,
+                g_fps,
+                g_saveCount,
                 g_devNode,
                 g_outDir,
                 argv[0],
@@ -467,6 +483,10 @@ int main(int argc, char *argv[]) {
             return 0;
         }
         argIdx++;
+    }
+    if (g_width == 0 || g_height == 0 || g_fps == 0 || g_saveCount == 0) {
+        fprintf(stderr, "Width, height, fps, and frame count must be positive\n");
+        return 2;
     }
     if (argIdx < argc)
         g_devNode = argv[argIdx++];
@@ -479,7 +499,8 @@ int main(int argc, char *argv[]) {
     printf("=== Sample: UVC → %s → VDEC → Save NV12 ===\n", g_bindMode ? "Bind" : "Manual");
     printf("  Device : %s\n", g_devNode);
     printf("  Output : %s\n", g_outDir);
-    printf("  Frames : %u\n\n", SAMPLE_SAVE_COUNT);
+    printf("  Format : %ux%u MJPEG at %u fps\n", g_width, g_height, g_fps);
+    printf("  Frames : %u\n\n", g_saveCount);
 
     S32 ret __attribute__((unused)) = SYS_Init();
     assert(ret == 0);
