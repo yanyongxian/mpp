@@ -277,7 +277,7 @@ static void test_uvc_vdec_venc_mux_pipeline(void) {
         VideoFrameInfo decFrame;
         memset(&decFrame, 0, sizeof(decFrame));
 
-        ret = VDEC_GetFrame(vdecChn, &decFrame, vdecTimeout);
+        ret = VDEC_GetLatestFrame(vdecChn, &decFrame, vdecTimeout);
         if (ret == ERR_VDEC_NO_FRAME)
             continue;
         if (ret == ERR_VDEC_EOS)
