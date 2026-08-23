@@ -101,6 +101,21 @@ S32 VDEC_SendStream(S32 s32ChnId, const StreamBufferInfo *pstStream, U32 u32Time
 S32 VDEC_GetFrame(S32 s32ChnId, VideoFrameInfo *pstFrameInfo, U32 u32TimeoutMs);
 
 /**
+ * @brief  Receive the newest decoded frame and discard older queued frames.
+ *         This is intended for real-time consumers that prefer minimum
+ *         latency over receiving every decoded frame. Queue draining is
+ *         atomic with respect to the decoder output thread, and references
+ *         held by discarded entries are released internally.
+ *         Caller MUST release the returned frame with VDEC_ReleaseFrame.
+ * @param  s32ChnId       Channel ID
+ * @param  pstFrameInfo   Output frame metadata
+ * @param  u32TimeoutMs   Timeout in ms (0 = non-blocking, -1 = infinite)
+ * @return 0 on success, ERR_VDEC_NO_FRAME if no frame is available,
+ *         ERR_VDEC_EOS on end-of-stream, or another error code
+ */
+S32 VDEC_GetLatestFrame(S32 s32ChnId, VideoFrameInfo *pstFrameInfo, U32 u32TimeoutMs);
+
+/**
  * @brief  Release a decoded frame back to the decoder.
  *         Decrements VB reference count and returns the buffer to the decoder
  *         for reuse. Must be paired with each successful VDEC_GetFrame.

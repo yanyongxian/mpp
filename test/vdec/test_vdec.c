@@ -1331,6 +1331,20 @@ static int run_api_suite(void) {
         return -1;
     }
 
+    memset(&frame, 0, sizeof(frame));
+    r = VDEC_GetLatestFrame(0, &frame, 0);
+    if (r != ERR_VDEC_NOT_STARTED) {
+        fprintf(stderr, "GetLatestFrame no channel: %d (expect NOT_STARTED)\n", r);
+        (void)VDEC_Exit();
+        return -1;
+    }
+    r = VDEC_GetLatestFrame(0, NULL, 0);
+    if (r != ERR_VDEC_NULL_PTR) {
+        fprintf(stderr, "GetLatestFrame NULL: %d\n", r);
+        (void)VDEC_Exit();
+        return -1;
+    }
+
     r = VDEC_QueryStatus(0, NULL);
     if (r != ERR_VDEC_NULL_PTR) {
         fprintf(stderr, "QueryStatus NULL: %d\n", r);

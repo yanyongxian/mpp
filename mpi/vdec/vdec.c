@@ -1370,6 +1370,55 @@ S32 VDEC_GetFrame(S32 s32ChnId, VideoFrameInfo *pstFrameInfo, U32 u32TimeoutMs) 
     return ERR_VDEC_OK;
 }
 
+S32 VDEC_GetLatestFrame(S32 s32ChnId, VideoFrameInfo *pstFrameInfo, U32 u32TimeoutMs) {
+    if (!pstFrameInfo)
+        return ERR_VDEC_NULL_PTR;
+    if (!vdec_chn_valid(s32ChnId))
+        return ERR_VDEC_INVALID_CHN;
+
+    VdecChnCtx *pChn = &g_stChn[s32ChnId];
+    if (!pChn->bUsed || pChn->eState != VDEC_CHN_STATE_STARTED)
+        return ERR_VDEC_NOT_STARTED;
+
+    pthread_mutex_lock(&pChn->depthLock);
+    while (pChn->u32DepthCount == 0) {
+        if (u32TimeoutMs == 0) {
+            pthread_mutex_unlock(&pChn->depthLock);
+            return ERR_VDEC_NO_FRAME;
+        }
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += u32TimeoutMs / 1000;
+        ts.tv_nsec += (u32TimeoutMs % 1000) * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000L;
+        }
+        if (pthread_cond_timedwait(&pChn->depthNotEmpty, &pChn->depthLock, &ts) != 0) {
+            pthread_mutex_unlock(&pChn->depthLock);
+            return ERR_VDEC_TIMEOUT;
+        }
+    }
+
+    while (pChn->u32DepthCount > 1) {
+        VdecDepthEntry *pOld = &pChn->pstDepth[pChn->u32DepthHead];
+        if (pOld->ulBufferId != 0)
+            VB_ReleaseBuffer(pOld->ulBufferId);
+        pChn->u32DepthHead = (pChn->u32DepthHead + 1) % pChn->u32DepthMax;
+        pChn->u32DepthCount--;
+    }
+
+    VdecDepthEntry *pNewest = &pChn->pstDepth[pChn->u32DepthHead];
+    memcpy(pstFrameInfo, &pNewest->stFrameInfo, sizeof(VideoFrameInfo));
+    pChn->u32DepthHead = (pChn->u32DepthHead + 1) % pChn->u32DepthMax;
+    pChn->u32DepthCount--;
+    pthread_mutex_unlock(&pChn->depthLock);
+
+    if (pstFrameInfo->ulBufferId == 0 && pstFrameInfo->stVdecFrameInfo.bEndOfStream)
+        return ERR_VDEC_EOS;
+    return ERR_VDEC_OK;
+}
+
 /**
  * @brief  Release a decoded frame back.
  *         Simply drops the VB ref. When refcount reaches 0, the buffer
