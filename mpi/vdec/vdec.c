@@ -1322,6 +1322,36 @@ S32 VDEC_SendStream(S32 s32ChnId, const StreamBufferInfo *pstStream, U32 u32Time
     return ERR_VDEC_OK;
 }
 
+static S32 vdec_wait_for_depth_entry_locked(VdecChnCtx *pChn, U32 u32TimeoutMs) {
+    if (pChn->u32DepthCount > 0)
+        return ERR_VDEC_OK;
+    if (u32TimeoutMs == 0)
+        return ERR_VDEC_NO_FRAME;
+
+    if (u32TimeoutMs == (U32)-1) {
+        while (pChn->u32DepthCount == 0) {
+            if (pthread_cond_wait(&pChn->depthNotEmpty, &pChn->depthLock) != 0)
+                return ERR_VDEC_TIMEOUT;
+        }
+        return ERR_VDEC_OK;
+    }
+
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += u32TimeoutMs / 1000;
+    deadline.tv_nsec += (u32TimeoutMs % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    while (pChn->u32DepthCount == 0) {
+        if (pthread_cond_timedwait(&pChn->depthNotEmpty, &pChn->depthLock, &deadline) != 0)
+            return ERR_VDEC_TIMEOUT;
+    }
+    return ERR_VDEC_OK;
+}
+
 S32 VDEC_GetFrame(S32 s32ChnId, VideoFrameInfo *pstFrameInfo, U32 u32TimeoutMs) {
     if (!pstFrameInfo)
         return ERR_VDEC_NULL_PTR;
@@ -1336,24 +1366,10 @@ S32 VDEC_GetFrame(S32 s32ChnId, VideoFrameInfo *pstFrameInfo, U32 u32TimeoutMs) 
     /* Pop from depth queue with optional timeout */
     pthread_mutex_lock(&pChn->depthLock);
 
-    while (pChn->u32DepthCount == 0) {
-        if (u32TimeoutMs == 0) {
-            pthread_mutex_unlock(&pChn->depthLock);
-            return ERR_VDEC_NO_FRAME;
-        }
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += u32TimeoutMs / 1000;
-        ts.tv_nsec += (u32TimeoutMs % 1000) * 1000000L;
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
-        }
-        S32 waitRet = pthread_cond_timedwait(&pChn->depthNotEmpty, &pChn->depthLock, &ts);
-        if (waitRet != 0) {
-            pthread_mutex_unlock(&pChn->depthLock);
-            return ERR_VDEC_TIMEOUT;
-        }
+    S32 waitRet = vdec_wait_for_depth_entry_locked(pChn, u32TimeoutMs);
+    if (waitRet != ERR_VDEC_OK) {
+        pthread_mutex_unlock(&pChn->depthLock);
+        return waitRet;
     }
 
     VdecDepthEntry *pEntry = &pChn->pstDepth[pChn->u32DepthHead];
@@ -1367,6 +1383,42 @@ S32 VDEC_GetFrame(S32 s32ChnId, VideoFrameInfo *pstFrameInfo, U32 u32TimeoutMs) 
     if (pstFrameInfo->ulBufferId == 0 && pstFrameInfo->stVdecFrameInfo.bEndOfStream)
         return ERR_VDEC_EOS;
 
+    return ERR_VDEC_OK;
+}
+
+S32 VDEC_GetLatestFrame(S32 s32ChnId, VideoFrameInfo *pstFrameInfo, U32 u32TimeoutMs) {
+    if (!pstFrameInfo)
+        return ERR_VDEC_NULL_PTR;
+    if (!vdec_chn_valid(s32ChnId))
+        return ERR_VDEC_INVALID_CHN;
+
+    VdecChnCtx *pChn = &g_stChn[s32ChnId];
+    if (!pChn->bUsed || pChn->eState != VDEC_CHN_STATE_STARTED)
+        return ERR_VDEC_NOT_STARTED;
+
+    pthread_mutex_lock(&pChn->depthLock);
+    S32 waitRet = vdec_wait_for_depth_entry_locked(pChn, u32TimeoutMs);
+    if (waitRet != ERR_VDEC_OK) {
+        pthread_mutex_unlock(&pChn->depthLock);
+        return waitRet;
+    }
+
+    while (pChn->u32DepthCount > 1) {
+        VdecDepthEntry *pOld = &pChn->pstDepth[pChn->u32DepthHead];
+        if (pOld->ulBufferId != 0)
+            VB_ReleaseBuffer(pOld->ulBufferId);
+        pChn->u32DepthHead = (pChn->u32DepthHead + 1) % pChn->u32DepthMax;
+        pChn->u32DepthCount--;
+    }
+
+    VdecDepthEntry *pNewest = &pChn->pstDepth[pChn->u32DepthHead];
+    memcpy(pstFrameInfo, &pNewest->stFrameInfo, sizeof(VideoFrameInfo));
+    pChn->u32DepthHead = (pChn->u32DepthHead + 1) % pChn->u32DepthMax;
+    pChn->u32DepthCount--;
+    pthread_mutex_unlock(&pChn->depthLock);
+
+    if (pstFrameInfo->ulBufferId == 0 && pstFrameInfo->stVdecFrameInfo.bEndOfStream)
+        return ERR_VDEC_EOS;
     return ERR_VDEC_OK;
 }
 
