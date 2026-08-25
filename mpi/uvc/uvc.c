@@ -84,6 +84,7 @@ typedef struct _UvcChnCtx {
     UL ulVbPool;
     UL aulVbBuf[UVC_MAX_V4L2_BUF];      /* VB buffer handle per slot */
     S32 as32DmaBufFd[UVC_MAX_V4L2_BUF]; /* dma-buf fd per slot */
+    BOOL abBaseRefHeld[UVC_MAX_V4L2_BUF]; /* UVC/V4L2 owns the base VB ref */
     BOOL bVbPoolCreated;
     /* depth queue (ring buffer, protected by depthLock) */
     UvcDepthEntry astDepth[UVC_DEPTH_MAX];
@@ -330,6 +331,7 @@ static S32 uvc_v4l2_req_bufs(UvcDevCtx *pDev, UvcChnCtx *pChn, U32 u32FrameSize)
             UVC_LOG_ERR("VB_GetBuffer[%u] failed", i);
             goto err_destroy_pool;
         }
+        pChn->abBaseRefHeld[i] = MPP_TRUE;
 
         /* get dma-buf fd for V4L2 DMABUF mode */
         S32 s32DmaBufFd = -1;
@@ -375,8 +377,10 @@ static S32 uvc_v4l2_req_bufs(UvcDevCtx *pDev, UvcChnCtx *pChn, U32 u32FrameSize)
 
 err_destroy_pool:
     for (U32 i = 0; i < u32BufCnt; i++) {
-        if (pChn->aulVbBuf[i] != 0)
+        if (pChn->aulVbBuf[i] != 0 && pChn->abBaseRefHeld[i]) {
             VB_ReleaseBuffer(pChn->aulVbBuf[i]);
+            pChn->abBaseRefHeld[i] = MPP_FALSE;
+        }
     }
     VB_DestroyPool(pChn->ulVbPool);
     pChn->bVbPoolCreated = MPP_FALSE;
@@ -436,9 +440,11 @@ static VOID uvc_v4l2_release_bufs(UvcDevCtx *pDev, UvcChnCtx *pChn) {
     if (pChn->bVbPoolCreated) {
         for (U32 i = 0; i < pChn->u32BufCnt; i++) {
             if (pChn->aulVbBuf[i] != 0) {
-                VB_ReleaseBuffer(pChn->aulVbBuf[i]);
+                if (pChn->abBaseRefHeld[i])
+                    VB_ReleaseBuffer(pChn->aulVbBuf[i]);
                 pChn->aulVbBuf[i] = 0;
             }
+            pChn->abBaseRefHeld[i] = MPP_FALSE;
             pChn->as32DmaBufFd[i] = -1;
         }
         VB_DestroyPool(pChn->ulVbPool);
@@ -578,10 +584,21 @@ static void *uvc_recycle_task(void *arg) {
         }
 
         /* QBUF back to V4L2.  We keep ref=1 (from VB_GetBuffer) to
-         * represent "V4L2 driver holds this buffer". */
+         * represent "V4L2 driver holds this buffer".  If shutdown
+         * started while VB_GetBuffer was waiting, return that ref instead. */
         pthread_mutex_lock(&g_stUvcCtx.lock);
-        uvc_v4l2_qbuf(pDev, pChn, slot);
+        if (!pChn->bRecycleRun) {
+            pthread_mutex_unlock(&g_stUvcCtx.lock);
+            VB_ReleaseBuffer(ulBuf);
+            break;
+        }
+        if (uvc_v4l2_qbuf(pDev, pChn, slot) == UVC_ERR_OK) {
+            pChn->abBaseRefHeld[slot] = MPP_TRUE;
+            pthread_mutex_unlock(&g_stUvcCtx.lock);
+            continue;
+        }
         pthread_mutex_unlock(&g_stUvcCtx.lock);
+        VB_ReleaseBuffer(ulBuf);
     }
 
     UVC_LOG_INFO("recycle task exiting: dev %d chn %d", dev, chn);
@@ -735,8 +752,14 @@ static void *uvc_capture_task(void *arg) {
             pthread_mutex_unlock(&pChn->depthLock);
         }
 
-        /* --- 3. Release the V4L2 base ref --- */
+        /* --- 3. Release the V4L2 base ref ---
+         * Mark the slot first while holding the UVC lock.  The recycle
+         * thread may acquire the free buffer immediately after release and
+         * will then set the state back to true after a successful QBUF. */
+        pthread_mutex_lock(&g_stUvcCtx.lock);
+        pChn->abBaseRefHeld[v4l2buf.index] = MPP_FALSE;
         VB_ReleaseBuffer(ulBuf);
+        pthread_mutex_unlock(&g_stUvcCtx.lock);
     }
 
     UVC_LOG_INFO("capture task exiting: dev %d chn %d", dev, chn);
@@ -1186,13 +1209,13 @@ S32 UVC_DisableChn(UVC_DEV dev, UVC_CHN chn) {
         }
     }
 
-    /* release per-channel VB buffers */
-    uvc_v4l2_release_bufs(pDev, pChn);
-
     if (!bAnyChnEnabled) {
-        /* stop V4L2 streaming */
+        /* Return all queued buffers before dropping their VB base refs. */
         uvc_v4l2_stream_off(pDev);
     }
+
+    /* release per-channel VB buffers */
+    uvc_v4l2_release_bufs(pDev, pChn);
 
     pthread_mutex_unlock(&g_stUvcCtx.lock);
 
