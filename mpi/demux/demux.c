@@ -13,11 +13,13 @@
 
 #include "demux.h"
 
+#include <errno.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "common/url_parser.h"
@@ -623,9 +625,15 @@ static void *demux_thread_proc(void *arg) {
             pChn->stStreamInfo.u32Height, pChn->stStreamInfo.u32Fps, pChn->stStreamInfo.eCodecType);
 
         /* Read loop */
-        /* For file protocols, pace the read rate to match playback fps,
-         * mimicking the natural pacing of network protocols (RTSP/RTMP). */
+        /* For file protocols, pace packet delivery against an absolute
+         * monotonic-clock deadline. A relative sleep after every packet adds
+         * demux, bind and decoder-backpressure time to the nominal frame
+         * interval, so playback progressively runs slower under load. */
         U32 u32FrameIntervalUs = 0;
+        U64 u64FirstPtsUs = 0;
+        U64 u64FilePacketIndex = 0;
+        struct timespec stPlaybackStart = {0};
+        BOOL bPlaybackClockStarted = MPP_FALSE;
         if (bIsFileProto) {
             U32 fps = pChn->stStreamInfo.u32Fps;
             if (fps == 0 || fps > 120)
@@ -655,13 +663,35 @@ static void *demux_thread_proc(void *arg) {
                 break;
             }
 
-            if (pkt.pu8Data && pkt.u32Size > 0) {
-                demux_deliver_packet(pChn, &pkt);
+            if (u32FrameIntervalUs > 0) {
+                if (!bPlaybackClockStarted) {
+                    if (clock_gettime(CLOCK_MONOTONIC, &stPlaybackStart) == 0) {
+                        u64FirstPtsUs = pkt.u64PTS;
+                        bPlaybackClockStarted = MPP_TRUE;
+                    }
+                } else {
+                    U64 u64RelativePtsUs = u64FilePacketIndex * u32FrameIntervalUs;
+                    if (pkt.u64PTS >= u64FirstPtsUs) {
+                        u64RelativePtsUs = pkt.u64PTS - u64FirstPtsUs;
+                    }
+
+                    struct timespec stDeadline = stPlaybackStart;
+                    stDeadline.tv_sec += (time_t)(u64RelativePtsUs / 1000000ULL);
+                    stDeadline.tv_nsec += (long)((u64RelativePtsUs % 1000000ULL) * 1000ULL);
+                    if (stDeadline.tv_nsec >= 1000000000L) {
+                        stDeadline.tv_sec++;
+                        stDeadline.tv_nsec -= 1000000000L;
+                    }
+
+                    while (!pChn->s32Stop &&
+                        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &stDeadline, NULL) == EINTR) {
+                    }
+                }
+                u64FilePacketIndex++;
             }
 
-            /* Pace file reading to match playback rate */
-            if (u32FrameIntervalUs > 0) {
-                usleep(u32FrameIntervalUs);
+            if (pkt.pu8Data && pkt.u32Size > 0) {
+                demux_deliver_packet(pChn, &pkt);
             }
         }
 
