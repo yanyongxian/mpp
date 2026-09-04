@@ -10,7 +10,7 @@
 
 #include <sys/socket.h>
 
-ssize_t mux_socket_send_no_signal(S32 s32Fd, const VOID *pData, size_t uSize,
-                                  S32 s32Flags) {
-  return send(s32Fd, pData, uSize, s32Flags | MSG_NOSIGNAL);
+ssize_t mux_socket_send_no_signal(
+    S32 s32Fd, const VOID *pData, size_t uSize, S32 s32Flags) {
+    return send(s32Fd, pData, uSize, s32Flags | MSG_NOSIGNAL);
 }
