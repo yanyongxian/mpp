@@ -57,6 +57,20 @@ extern "C" {
 #define VB_HANDLE_TO_POOL(h) ((U32)((h) >> 16))
 #define VB_HANDLE_TO_BLK(h) ((U32)((h) & 0xFFFF))
 
+/* Opaque token: [63:13] = export generation, [12:8] = pool, [7:0] = block. */
+#define VB_TOKEN_BLOCK_BITS 8
+#define VB_TOKEN_POOL_BITS 5
+#define VB_TOKEN_LOCATION_BITS (VB_TOKEN_BLOCK_BITS + VB_TOKEN_POOL_BITS)
+#define VB_TOKEN_BLOCK_MASK ((U64)((1U << VB_TOKEN_BLOCK_BITS) - 1))
+#define VB_TOKEN_POOL_MASK ((U64)((1U << VB_TOKEN_POOL_BITS) - 1))
+#define VB_TOKEN_GENERATION_MASK (UINT64_MAX >> VB_TOKEN_LOCATION_BITS)
+#define VB_TOKEN_ENCODE(generation, pool_id, blk_idx)                                                  \
+    ((((U64)(generation) & VB_TOKEN_GENERATION_MASK) << VB_TOKEN_LOCATION_BITS) |                      \
+        (((U64)(pool_id) & VB_TOKEN_POOL_MASK) << VB_TOKEN_BLOCK_BITS) |                              \
+        ((U64)(blk_idx) & VB_TOKEN_BLOCK_MASK))
+#define VB_TOKEN_TO_POOL(token) ((U32)(((token) >> VB_TOKEN_BLOCK_BITS) & VB_TOKEN_POOL_MASK))
+#define VB_TOKEN_TO_BLK(token) ((U32)((token) & VB_TOKEN_BLOCK_MASK))
+
 #ifndef PAGE_SIZE
 #define PAGE_SIZE (4096)
 #endif
@@ -155,6 +169,13 @@ static VideoFrameFmt g_stVideoFrameFmt[] = {
     {
         .ePixelFormat = MPP_PIXEL_FORMAT_YUYV,
         .cName = "YUYV",
+        .u8DataPlanes = 1,
+        .u8WidthDepth = {16},
+        .u8HeightDepth = {8},
+    },
+    {
+        .ePixelFormat = MPP_PIXEL_FORMAT_UYVY,
+        .cName = "UYVY",
         .u8DataPlanes = 1,
         .u8WidthDepth = {16},
         .u8HeightDepth = {8},
@@ -495,11 +516,41 @@ static VbBlockShm *vb_get_block(UL handle, VbPoolShm **out_pool) {
     return &pool->blocks[blk_idx];
 }
 
+static BOOL vb_mod_id_valid(ModId enModId) {
+    return enModId > 0 && enModId < MPP_ID_MAX;
+}
+
+static int vb_owner_ref_sum_locked(const VbBlockShm *blk) {
+    int sum = 0;
+    for (U32 mod = 1; mod < MPP_ID_MAX; mod++)
+        sum += atomic_load_explicit(&blk->usr_ref_cnt[mod], memory_order_relaxed);
+    return sum;
+}
+
+/* Caller must hold pool->lock. Keeping the owner and total counters under the
+ * same lock makes their invariant one serialized state transition. */
+static S32 vb_ref_add_by_mod_locked(VbBlockShm *blk, ModId enModId) {
+    if (!vb_mod_id_valid(enModId))
+        return VB_ERR_INVAL;
+    int total_ref = atomic_load_explicit(&blk->ref_cnt, memory_order_acquire);
+    if (blk->state != VB_BLK_USED || total_ref <= 0)
+        return VB_ERR_STATE;
+    if (vb_owner_ref_sum_locked(blk) != total_ref)
+        return VB_ERR_STATE;
+
+    atomic_fetch_add_explicit(&blk->usr_ref_cnt[enModId], 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&blk->ref_cnt, 1, memory_order_release);
+    return VB_ERR_OK;
+}
+
 /* Return block to free-list; caller must hold pool->lock */
 static void vb_return_block(VbPoolShm *pool, VbBlockShm *blk) {
+    for (U32 i = 0; i < MPP_ID_MAX; i++)
+        atomic_store_explicit(&blk->usr_ref_cnt[i], 0, memory_order_relaxed);
     blk->state = VB_BLK_FREE;
     blk->pts = 0;
-    blk->exported = 0;
+    atomic_store_explicit(&blk->exported, 0, memory_order_relaxed);
+    atomic_store_explicit(&blk->export_token, 0, memory_order_release);
     blk->next_free = pool->free_head;
     pool->free_head = blk->blk_idx;
     pool->free_cnt++;
@@ -538,11 +589,14 @@ static S32 vb_pool_alloc_blocks(VbPoolShm *pool) {
         blk->pool_id = pool->id;
         blk->blk_idx = i;
         atomic_init(&blk->ref_cnt, 0);
+        for (U32 mod = 0; mod < MPP_ID_MAX; mod++)
+            atomic_init(&blk->usr_ref_cnt[mod], 0);
         blk->state = VB_BLK_FREE;
         blk->phy_addr = phy;
         blk->size = buf_size;
         blk->pts = 0;
-        blk->exported = 0;
+        atomic_init(&blk->exported, 0);
+        atomic_init(&blk->export_token, 0);
         blk->frame_info_set = 0;
         memset(&blk->frame_info, 0, sizeof(blk->frame_info));
         blk->owner_pid = my_pid;
@@ -596,6 +650,9 @@ static void vb_pool_free_blocks(VbPoolShm *pool) {
         pthread_mutex_unlock(&g_local_lock);
 
         blk->state = VB_BLK_FREE;
+        atomic_store(&blk->ref_cnt, 0);
+        for (U32 mod = 0; mod < MPP_ID_MAX; mod++)
+            atomic_store(&blk->usr_ref_cnt[mod], 0);
         blk->owner_pid = 0;
         blk->owner_fd = -1;
         blk->frame_info_set = 0;
@@ -806,10 +863,14 @@ S32 VB_DestroyPool(UL ulPool) {
     return VB_ERR_OK;
 }
 
-UL VB_GetBuffer(UL ulPool, U32 u32TimeoutMs) {
+static UL vb_get_buffer_by_mod(UL ulPool, ModId enModId, U32 u32TimeoutMs) {
     MppSharedMem *shm = mpp_shm_get();
     U32 pool_id = (U32)ulPool;
 
+    if (!vb_mod_id_valid(enModId)) {
+        VB_LOG_ERR("invalid module id %d", enModId);
+        return VB_INVALID_HANDLE;
+    }
     if (!shm || !shm->vb_inited) {
         VB_LOG_ERR("VB not initialized");
         return VB_INVALID_HANDLE;
@@ -874,6 +935,9 @@ UL VB_GetBuffer(UL ulPool, U32 u32TimeoutMs) {
 
     blk->state = VB_BLK_USED;
     atomic_store(&blk->ref_cnt, 1);
+    for (U32 mod = 0; mod < MPP_ID_MAX; mod++)
+        atomic_store(&blk->usr_ref_cnt[mod], 0);
+    atomic_store(&blk->usr_ref_cnt[enModId], 1);
     blk->pts = 0;
 
     pool->free_cnt--;
@@ -890,11 +954,64 @@ UL VB_GetBuffer(UL ulPool, U32 u32TimeoutMs) {
     return blk->handle;
 }
 
-S32 VB_ReleaseBuffer(UL ulBuff) {
+UL VB_ModGetBuffer(UL ulPool, ModId enModId, U32 u32TimeoutMs) {
+    return vb_get_buffer_by_mod(ulPool, enModId, u32TimeoutMs);
+}
+
+UL VB_GetBuffer(UL ulPool, U32 u32TimeoutMs) {
+    return vb_get_buffer_by_mod(ulPool, MPP_ID_SYS, u32TimeoutMs);
+}
+
+/* Drop one reference owned by enModId. The caller must hold shm->vb_lock for
+ * reading; this helper always releases it. */
+static S32 vb_release_ref_locked(
+    MppSharedMem *shm, VbPoolShm *pool, VbBlockShm *blk, UL handle, ModId enModId) {
+    if (!vb_mod_id_valid(enModId)) {
+        pthread_rwlock_unlock(&shm->vb_lock);
+        return VB_ERR_INVAL;
+    }
+
+    vb_mutex_lock(&pool->lock);
+    int mod_ref = atomic_load_explicit(&blk->usr_ref_cnt[enModId], memory_order_acquire);
+    int total_ref = atomic_load_explicit(&blk->ref_cnt, memory_order_acquire);
+    int owner_sum = vb_owner_ref_sum_locked(blk);
+    if (blk->state != VB_BLK_USED || mod_ref <= 0 || total_ref <= 0 || owner_sum != total_ref) {
+        VB_LOG_ERR(
+            "release rejected mod=%d handle=0x%lx mod_ref=%d total_ref=%d owner_sum=%d",
+            enModId, handle, mod_ref, total_ref, owner_sum);
+        pthread_mutex_unlock(&pool->lock);
+        pthread_rwlock_unlock(&shm->vb_lock);
+        return VB_ERR_STATE;
+    }
+
+    atomic_store_explicit(&blk->usr_ref_cnt[enModId], mod_ref - 1, memory_order_relaxed);
+    atomic_store_explicit(&blk->ref_cnt, total_ref - 1, memory_order_release);
+
+    if (total_ref == 1) {
+        pthread_rwlock_unlock(&shm->vb_lock);
+
+        /* Free non-owner local mappings before making the block allocatable. */
+        pthread_mutex_lock(&g_local_lock);
+        VbLocalEntry *ent = vb_local_find(handle);
+        if (ent && !ent->is_owner)
+            vb_local_free_entry(ent);
+        pthread_mutex_unlock(&g_local_lock);
+
+        vb_return_block(pool, blk);
+        pthread_mutex_unlock(&pool->lock);
+    } else {
+        pthread_mutex_unlock(&pool->lock);
+        pthread_rwlock_unlock(&shm->vb_lock);
+    }
+
+    return VB_ERR_OK;
+}
+
+S32 VB_ModReleaseBuffer(UL ulBuff, ModId enModId) {
     MppSharedMem *shm = mpp_shm_get();
     VbPoolShm *pool = NULL;
 
-    if (ulBuff == VB_INVALID_HANDLE)
+    if (ulBuff == VB_INVALID_HANDLE || !vb_mod_id_valid(enModId))
         return VB_ERR_INVAL;
     if (!shm || !shm->vb_inited)
         return VB_ERR_NOT_INIT;
@@ -908,66 +1025,51 @@ S32 VB_ReleaseBuffer(UL ulBuff) {
         return VB_ERR_NOT_FOUND;
     }
 
-    int old_ref = atomic_fetch_sub(&blk->ref_cnt, 1);
-    if (old_ref <= 0) {
-        atomic_store(&blk->ref_cnt, 0);
-        VB_LOG_ERR("double release on handle 0x%lx", ulBuff);
-        pthread_rwlock_unlock(&shm->vb_lock);
-        return VB_ERR_STATE;
-    }
+    return vb_release_ref_locked(shm, pool, blk, ulBuff, enModId);
+}
 
-    if (old_ref == 1) {
-        /* ref dropped to 0 — return block to pool */
-        vb_mutex_lock(&pool->lock);
-        pthread_rwlock_unlock(&shm->vb_lock);
-
-        /* free non-owner local mappings */
-        pthread_mutex_lock(&g_local_lock);
-        VbLocalEntry *ent = vb_local_find(ulBuff);
-        if (ent && !ent->is_owner)
-            vb_local_free_entry(ent);
-        pthread_mutex_unlock(&g_local_lock);
-
-        vb_return_block(pool, blk);
-        pthread_mutex_unlock(&pool->lock);
-    } else {
-        pthread_rwlock_unlock(&shm->vb_lock);
-    }
-
-    return VB_ERR_OK;
+S32 VB_ReleaseBuffer(UL ulBuff) {
+    return VB_ModReleaseBuffer(ulBuff, MPP_ID_SYS);
 }
 
 S32 VB_RefAdd(UL ulBuff) {
-    MppSharedMem *shm = mpp_shm_get();
+    return VB_ModRefAdd(ulBuff, MPP_ID_SYS);
+}
 
-    if (ulBuff == VB_INVALID_HANDLE)
+S32 VB_ModRefAdd(UL ulBuff, ModId enModId) {
+    MppSharedMem *shm = mpp_shm_get();
+    VbPoolShm *pool = NULL;
+
+    if (ulBuff == VB_INVALID_HANDLE || !vb_mod_id_valid(enModId))
         return VB_ERR_INVAL;
     if (!shm || !shm->vb_inited)
         return VB_ERR_NOT_INIT;
 
     pthread_rwlock_rdlock(&shm->vb_lock);
 
-    VbBlockShm *blk = vb_get_block(ulBuff, NULL);
-    if (!blk) {
+    VbBlockShm *blk = vb_get_block(ulBuff, &pool);
+    if (!blk || !pool) {
         VB_LOG_ERR("handle 0x%lx not found", ulBuff);
         pthread_rwlock_unlock(&shm->vb_lock);
         return VB_ERR_NOT_FOUND;
     }
 
-    int old = atomic_fetch_add(&blk->ref_cnt, 1);
-    if (old <= 0) {
-        atomic_fetch_sub(&blk->ref_cnt, 1);
-        VB_LOG_ERR("RefAdd on free block handle 0x%lx", ulBuff);
-        pthread_rwlock_unlock(&shm->vb_lock);
-        return VB_ERR_STATE;
-    }
+    vb_mutex_lock(&pool->lock);
+    S32 ret = vb_ref_add_by_mod_locked(blk, enModId);
+    pthread_mutex_unlock(&pool->lock);
 
     pthread_rwlock_unlock(&shm->vb_lock);
-    return VB_ERR_OK;
+    if (ret != VB_ERR_OK)
+        VB_LOG_ERR("RefAdd failed mod=%d handle=0x%lx ret=%d", enModId, ulBuff, ret);
+    return ret;
 }
 
 S32 VB_RefSub(UL ulBuff) {
     return VB_ReleaseBuffer(ulBuff);
+}
+
+S32 VB_ModRefSub(UL ulBuff, ModId enModId) {
+    return VB_ModReleaseBuffer(ulBuff, enModId);
 }
 
 S32 VB_SetBufferPTS(UL ulBuff, U64 u64PTS) {
@@ -1115,9 +1217,9 @@ S32 VB_GetFrameInfo(UL ulBuff, VideoFrameInfo *pstFrameInfo) {
 /*
  * With shared memory, all processes see the same pool/block metadata.
  * Export marks the block as exported (adds a ref).
- * Import in another process: handle is already valid in shared memory,
- * the importer just needs to pidfd_getfd to get a local dma-buf fd.
- * Token = handle (globally unique in shared memory).
+ * Import in another process decodes the block location and validates the
+ * export generation before taking a reference. A delayed token can therefore
+ * never alias a newer frame after the block slot is reused.
  */
 
 S32 VB_Export(UL ulBuff, U64 *pu64Token) {
@@ -1130,25 +1232,43 @@ S32 VB_Export(UL ulBuff, U64 *pu64Token) {
 
     pthread_rwlock_rdlock(&shm->vb_lock);
 
-    VbBlockShm *blk = vb_get_block(ulBuff, NULL);
-    if (!blk) {
+    VbPoolShm *pool = NULL;
+    VbBlockShm *blk = vb_get_block(ulBuff, &pool);
+    if (!blk || !pool) {
         pthread_rwlock_unlock(&shm->vb_lock);
         return VB_ERR_NOT_FOUND;
     }
-    if (atomic_load(&blk->ref_cnt) <= 0) {
+
+    vb_mutex_lock(&pool->lock);
+    if (pool->state != VB_POOL_ACTIVE || blk->state != VB_BLK_USED || atomic_load(&blk->ref_cnt) <= 0) {
+        pthread_mutex_unlock(&pool->lock);
         pthread_rwlock_unlock(&shm->vb_lock);
         return VB_ERR_STATE;
     }
-    if (blk->exported) {
+    if (atomic_load_explicit(&blk->exported, memory_order_acquire)) {
         VB_LOG_ERR("block 0x%lx already exported", ulBuff);
+        pthread_mutex_unlock(&pool->lock);
         pthread_rwlock_unlock(&shm->vb_lock);
         return VB_ERR_STATE;
     }
 
-    atomic_fetch_add(&blk->ref_cnt, 1);
-    blk->exported = 1;
-    *pu64Token = (U64)ulBuff;
+    U64 generation;
+    do {
+        generation = pool->next_export_generation++ & VB_TOKEN_GENERATION_MASK;
+    } while (generation == 0);
 
+    S32 ref_ret = vb_ref_add_by_mod_locked(blk, MPP_ID_SYS);
+    if (ref_ret != VB_ERR_OK) {
+        pthread_mutex_unlock(&pool->lock);
+        pthread_rwlock_unlock(&shm->vb_lock);
+        return ref_ret;
+    }
+    const U64 token = VB_TOKEN_ENCODE(generation, blk->pool_id, blk->blk_idx);
+    atomic_store_explicit(&blk->export_token, token, memory_order_release);
+    atomic_store_explicit(&blk->exported, 1, memory_order_release);
+    *pu64Token = token;
+
+    pthread_mutex_unlock(&pool->lock);
     pthread_rwlock_unlock(&shm->vb_lock);
 
     VB_LOG_INFO("VB_Export: handle=0x%" PRIx64 " token=0x%" PRIx64, (uint64_t)ulBuff, (uint64_t)*pu64Token);
@@ -1157,31 +1277,38 @@ S32 VB_Export(UL ulBuff, U64 *pu64Token) {
 
 S32 VB_Import(U64 u64Token, UL *pulBuff) {
     MppSharedMem *shm = mpp_shm_get();
-    UL handle = (UL)u64Token;
+    U32 pool_id = VB_TOKEN_TO_POOL(u64Token);
+    U32 blk_idx = VB_TOKEN_TO_BLK(u64Token);
+    UL handle = VB_HANDLE_ENCODE(pool_id, blk_idx);
 
     if (!pulBuff)
         return VB_ERR_INVAL;
     if (!shm || !shm->vb_inited)
         return VB_ERR_NOT_INIT;
-    if (handle == VB_INVALID_HANDLE)
+    if (u64Token == 0 || pool_id == 0 || pool_id > MPP_MAX_POOL || blk_idx >= MPP_MAX_BLK)
         return VB_ERR_INVAL;
 
     pthread_rwlock_rdlock(&shm->vb_lock);
 
-    VbBlockShm *blk = vb_get_block(handle, NULL);
-    if (!blk) {
+    VbPoolShm *pool = NULL;
+    VbBlockShm *blk = vb_get_block(handle, &pool);
+    if (!blk || !pool) {
         pthread_rwlock_unlock(&shm->vb_lock);
         return VB_ERR_NOT_FOUND;
     }
-    if (atomic_load(&blk->ref_cnt) <= 0 || !blk->exported) {
-        pthread_rwlock_unlock(&shm->vb_lock);
-        return VB_ERR_STATE;
-    }
 
-    /* add import reference */
-    atomic_fetch_add(&blk->ref_cnt, 1);
+    vb_mutex_lock(&pool->lock);
+    const U64 observed_token = atomic_load_explicit(&blk->export_token, memory_order_acquire);
+    if (pool->state != VB_POOL_ACTIVE || blk->state != VB_BLK_USED ||
+        !atomic_load_explicit(&blk->exported, memory_order_acquire) || observed_token != u64Token ||
+        vb_ref_add_by_mod_locked(blk, MPP_ID_SYS) != VB_ERR_OK) {
+        pthread_mutex_unlock(&pool->lock);
+        pthread_rwlock_unlock(&shm->vb_lock);
+        return VB_ERR_STALE_TOKEN;
+    }
     *pulBuff = handle;
 
+    pthread_mutex_unlock(&pool->lock);
     pthread_rwlock_unlock(&shm->vb_lock);
 
     /* ensure local mapping (will pidfd_getfd if cross-process) */
@@ -1202,21 +1329,26 @@ S32 VB_Unexport(UL ulBuff) {
 
     pthread_rwlock_rdlock(&shm->vb_lock);
 
-    VbBlockShm *blk = vb_get_block(ulBuff, NULL);
-    if (!blk) {
+    VbPoolShm *pool = NULL;
+    VbBlockShm *blk = vb_get_block(ulBuff, &pool);
+    if (!blk || !pool) {
         pthread_rwlock_unlock(&shm->vb_lock);
         return VB_ERR_NOT_FOUND;
     }
-    if (!blk->exported) {
+
+    vb_mutex_lock(&pool->lock);
+    if (!atomic_exchange_explicit(&blk->exported, 0, memory_order_acq_rel)) {
         VB_LOG_ERR("block 0x%lx not exported", ulBuff);
+        pthread_mutex_unlock(&pool->lock);
         pthread_rwlock_unlock(&shm->vb_lock);
         return VB_ERR_STATE;
     }
 
-    blk->exported = 0;
+    atomic_store_explicit(&blk->export_token, 0, memory_order_release);
+    pthread_mutex_unlock(&pool->lock);
     pthread_rwlock_unlock(&shm->vb_lock);
 
-    return VB_ReleaseBuffer(ulBuff);
+    return VB_ModRefSub(ulBuff, MPP_ID_SYS);
 }
 
 /* ======================== Query Helpers ======================== */
@@ -1366,10 +1498,19 @@ VOID VB_DumpPools(VOID) {
                 (uint64_t)blk->handle,
                 blk_state_str[blk->state],
                 rc,
-                blk->exported,
+                atomic_load_explicit(&blk->exported, memory_order_relaxed),
                 (uint64_t)blk->phy_addr,
                 blk->owner_pid,
                 blk->owner_fd);
+            if (rc > 0) {
+                printf("             owners:");
+                for (U32 mod = 1; mod < MPP_ID_MAX; mod++) {
+                    int mod_ref = atomic_load_explicit(&blk->usr_ref_cnt[mod], memory_order_relaxed);
+                    if (mod_ref > 0)
+                        printf(" mod%u=%d", mod, mod_ref);
+                }
+                printf("\n");
+            }
         }
     }
 

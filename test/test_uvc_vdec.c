@@ -236,7 +236,8 @@ static void test_uvc_vdec_venc_mux_pipeline(void) {
 
     /* --- Main loop: UVC → VDEC → VENC (continuous until Ctrl+C) --- */
     U32 u32Done = 0;
-    const U32 vdecTimeout = 1000;
+    const U32 vdecTimeout = (U32)-1;
+    const U32 vencTimeout = 1000;
 
     printf("  [INFO] UVC→VDEC→VENC→MUX running, Ctrl+C to stop\n");
     printf("  [INFO] RTSP URL: %s\n", g_rtspUrl);
@@ -277,7 +278,7 @@ static void test_uvc_vdec_venc_mux_pipeline(void) {
         VideoFrameInfo decFrame;
         memset(&decFrame, 0, sizeof(decFrame));
 
-        ret = VDEC_GetFrame(vdecChn, &decFrame, vdecTimeout);
+        ret = VDEC_GetLatestFrame(vdecChn, &decFrame, vdecTimeout);
         if (ret == ERR_VDEC_NO_FRAME)
             continue;
         if (ret == ERR_VDEC_EOS)
@@ -300,7 +301,7 @@ static void test_uvc_vdec_venc_mux_pipeline(void) {
         /* Receive encoded stream and forward to MUX */
         StreamBufferInfo encStream;
         memset(&encStream, 0, sizeof(encStream));
-        ret = VENC_GetStream(vencChn, &encStream, vdecTimeout);
+        ret = VENC_GetStream(vencChn, &encStream, vencTimeout);
         if (ret == ERR_VENC_OK) {
             MuxPacket muxPkt;
             memset(&muxPkt, 0, sizeof(muxPkt));

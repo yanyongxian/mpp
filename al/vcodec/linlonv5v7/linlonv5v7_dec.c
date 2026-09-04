@@ -205,7 +205,8 @@ static S32 checkInputParameters(MppStreamCodecType type, MppPixelFormat format) 
         return MPP_NOT_SUPPORTED_FORMAT;
     }
 
-    if (format != MPP_PIXEL_FORMAT_I420 && format != MPP_PIXEL_FORMAT_NV12 && format != MPP_PIXEL_FORMAT_NV21) {
+    if (format != MPP_PIXEL_FORMAT_I420 && format != MPP_PIXEL_FORMAT_NV12 && format != MPP_PIXEL_FORMAT_NV21 &&
+        format != MPP_PIXEL_FORMAT_YUYV && format != MPP_PIXEL_FORMAT_UYVY) {
         error("not support this format (%d)!", format);
         return MPP_NOT_SUPPORTED_FORMAT;
     }
@@ -482,9 +483,9 @@ S32 al_dec_decode(ALBaseContext *ctx, const StreamBufferInfo *pstStream) {
 
     if (unlikely(context->nInputQueuedNum < (U32)getBufNum(getInputPort(context->stCodec)))) {
         Buffer *buf = getBuffer(getInputPort(context->stCodec), context->nInputQueuedNum);
-        memcpy(getUserPtr(buf, 0), pstStream->pu8Addr, pstStream->u32Size);
-        struct v4l2_buffer *b = getV4l2Buffer(buf);
-        b->bytesused = pstStream->u32Size;
+        ret = copyInputPayload(buf, pstStream, context->eCodecType);
+        if (ret != MPP_OK)
+            return ret;
         setEndOfFrame(buf, MPP_TRUE);
         setEndOfStream(buf, MPP_FALSE);
         setTimeStamp(buf, (S64)pstStream->u64PTS);
@@ -496,17 +497,28 @@ S32 al_dec_decode(ALBaseContext *ctx, const StreamBufferInfo *pstStream) {
         context->nInputQueuedNum++;
         context->nInputQueueLeftNum--;
     } else {
-        ret = runPoll(context->stCodec, &p);
-        if (MPP_OK == ret && p.revents & POLLOUT) {
-            ret = handleInputBuffer(getInputPort(context->stCodec), context->bInputEos, pstStream);
-            if (ret < 0) {
-                error("handleInputBuffer failed, should not failed, please check!");
-                return ret;
-            }
-            context->nInputQueueLeftNum--;
-        } else {
+        do {
+            ret = poll(&p, 1, POLL_TIMEOUT);
+        } while (ret < 0 && errno == EINTR);
+
+        if (ret < 0) {
+            error("input poll failed: %s", strerror(errno));
             return MPP_POLL_FAILED;
         }
+        if (p.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            error("input poll failed: revents=0x%x", p.revents);
+            return MPP_POLL_FAILED;
+        }
+        if (ret == 0 || !(p.revents & POLLOUT))
+            return MPP_DATAQUEUE_FULL;
+
+        ret = handleInputBuffer(getInputPort(context->stCodec), context->bInputEos, pstStream,
+            context->eCodecType);
+        if (ret < 0) {
+            error("handleInputBuffer failed, should not failed, please check!");
+            return ret;
+        }
+        context->nInputQueueLeftNum--;
     }
     return MPP_OK;
 }

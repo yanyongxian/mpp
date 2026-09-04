@@ -23,6 +23,9 @@ extern "C" {
 #endif
 #endif /* __cplusplus */
 
+/* VB_Import result for a token that has been revoked or superseded by slot reuse. */
+#define VB_ERR_STALE_TOKEN (-10)
+
 /**
  * @description: Initialize the Video Buffer (VB) module, allocate system resources.
  *               Must be called before any other VB module interfaces, and only once.
@@ -63,28 +66,70 @@ S32 VB_DestroyPool(UL ulPool);
 UL VB_GetBuffer(UL ulPool, U32 u32TimeoutMs);
 
 /**
- * @description: Release a buffer back to its pool for reuse.
- *               Decrements reference count; buffer is returned to pool when count reaches 0.
+ * @description: Get a buffer whose initial reference belongs to enModId.
+ *               Pair the returned reference with VB_ModReleaseBuffer.
+ * @param {UL} ulPool Pool ID from which to get the buffer
+ * @param {ModId} enModId Module that owns the initial reference
+ * @param {U32} u32TimeoutMs Timeout in milliseconds (0 = non-blocking, -1 = infinite)
+ * @return {UL} Returns buffer ID on success, 0 on failure or timeout
+ */
+UL VB_ModGetBuffer(UL ulPool, ModId enModId, U32 u32TimeoutMs);
+
+/**
+ * @description: Release one application/SYS reference.
+ *               Cannot consume a reference owned by another MPP module.
+ *               The buffer is returned to the pool when all owners reach 0.
  * @param {UL} ulBuff Buffer ID to release
  * @return {S32} Returns 0 on success, error code on failure
  */
 S32 VB_ReleaseBuffer(UL ulBuff);
 
 /**
- * @description: Increment the reference count of a buffer.
- *               Used when multiple modules need to access the same buffer simultaneously.
+ * @description: Release one reference owned by enModId, paired with
+ *               VB_ModGetBuffer. The buffer is returned to its pool when all
+ *               module references reach 0.
+ * @param {UL} ulBuff Buffer ID to release
+ * @param {ModId} enModId Module releasing its initial reference
+ * @return {S32} Returns 0 on success, error code on failure
+ */
+S32 VB_ModReleaseBuffer(UL ulBuff, ModId enModId);
+
+/**
+ * @description: Increment the application/SYS reference count of a buffer.
+ *               Modules must use VB_ModRefAdd for module-owned references.
  * @param {UL} ulBuff Buffer ID whose reference count to increment
  * @return {S32} Returns 0 on success, error code on failure
  */
 S32 VB_RefAdd(UL ulBuff);
 
 /**
- * @description: Decrement the reference count of a buffer.
- *               Buffer is returned to pool when reference count reaches 0, paired with VB_RefAdd.
+ * @description: Decrement one application/SYS reference, paired with VB_RefAdd.
+ *               Cannot consume a reference owned by another MPP module.
  * @param {UL} ulBuff Buffer ID whose reference count to decrement
  * @return {S32} Returns 0 on success, error code on failure
  */
 S32 VB_RefSub(UL ulBuff);
+
+/**
+ * @description: Add one reference owned by the specified MPP module.
+ *               The module becomes responsible for releasing this reference
+ *               with VB_ModRefSub. Public/application references use
+ *               MPP_ID_SYS through VB_RefAdd/VB_ReleaseBuffer.
+ * @param {UL} ulBuff Buffer ID whose module reference to increment
+ * @param {ModId} enModId Module responsible for releasing the reference
+ * @return {S32} Returns 0 on success, error code on failure
+ */
+S32 VB_ModRefAdd(UL ulBuff, ModId enModId);
+
+/**
+ * @description: Release one reference owned by the specified MPP module.
+ *               Fails without changing the total count when that module does
+ *               not own a reference.
+ * @param {UL} ulBuff Buffer ID whose module reference to decrement
+ * @param {ModId} enModId Module releasing its own reference
+ * @return {S32} Returns 0 on success, error code on failure
+ */
+S32 VB_ModRefSub(UL ulBuff, ModId enModId);
 
 /**
  * @description: Set the PTS (Presentation Time Stamp) for a buffer.
@@ -129,8 +174,8 @@ S32 VB_UpdateBufferFrameInfo(UL ulBuff, const VideoFrameInfo *pstFrameInfo);
  *               Marks the buffer as exported and returns a share token that can be
  *               passed to another process for import. Adds a reference to prevent
  *               premature release.
- *               NOTE: In user-space simulation, the token is the buffer handle itself.
- *               Real cross-process sharing requires kernel dma-buf support.
+ *               The token is opaque and identifies this specific export generation;
+ *               it must not be interpreted as a buffer handle.
  * @param {UL} ulBuff Buffer ID to export
  * @param {U64 *} pu64Token Output parameter to receive the share token
  * @return {S32} Returns 0 on success, error code on failure
@@ -141,11 +186,12 @@ S32 VB_Export(UL ulBuff, U64 *pu64Token);
  * @description: Import a buffer from a share token obtained via VB_Export.
  *               Adds a reference and returns the buffer handle for local use.
  *               Caller must call VB_ReleaseBuffer when done with the imported buffer.
- *               NOTE: In user-space simulation within the same process only.
- *               Real cross-process import requires kernel dma-buf support.
+ *               A revoked or stale token is rejected, including after its buffer slot
+ *               has been reused for a newer frame.
  * @param {U64} u64Token Share token from VB_Export
  * @param {UL *} pulBuff Output parameter to receive the buffer handle
- * @return {S32} Returns 0 on success, error code on failure
+ * @return {S32} Returns 0 on success, VB_ERR_STALE_TOKEN for an expired export,
+ *               or another negative error code on failure
  */
 S32 VB_Import(U64 u64Token, UL *pulBuff);
 

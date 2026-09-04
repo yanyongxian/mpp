@@ -80,7 +80,10 @@ S32 VDEC_DisableChn(S32 s32ChnId);
  *         Caller must keep the buffer valid until this call returns.
  * @param  s32ChnId   Channel ID
  * @param  pstStream  Stream packet (pu8Addr, u32Size, u64PTS, bKeyFrame, etc.)
- * @return 0 on success, error code on failure
+ * @param  u32TimeoutMs  0 = non-blocking, finite value = wait up to that many
+ *                       milliseconds, (U32)-1 = wait until accepted or stopped
+ * @return 0 on success, ERR_VDEC_BUSY for non-blocking backpressure,
+ *         ERR_VDEC_TIMEOUT when a finite wait expires, or another error code
  */
 S32 VDEC_SendStream(S32 s32ChnId, const StreamBufferInfo *pstStream, U32 u32TimeoutMs);
 
@@ -96,6 +99,21 @@ S32 VDEC_SendStream(S32 s32ChnId, const StreamBufferInfo *pstStream, U32 u32Time
  *         ERR_VDEC_EOS on end-of-stream, error code on failure
  */
 S32 VDEC_GetFrame(S32 s32ChnId, VideoFrameInfo *pstFrameInfo, U32 u32TimeoutMs);
+
+/**
+ * @brief  Receive the newest decoded frame and discard older queued frames.
+ *         This is intended for real-time consumers that prefer minimum
+ *         latency over receiving every decoded frame. Queue draining is
+ *         atomic with respect to the decoder output thread, and references
+ *         held by discarded entries are released internally.
+ *         Caller MUST release the returned frame with VDEC_ReleaseFrame.
+ * @param  s32ChnId       Channel ID
+ * @param  pstFrameInfo   Output frame metadata
+ * @param  u32TimeoutMs   Timeout in ms (0 = non-blocking, -1 = infinite)
+ * @return 0 on success, ERR_VDEC_NO_FRAME if no frame is available,
+ *         ERR_VDEC_EOS on end-of-stream, or another error code
+ */
+S32 VDEC_GetLatestFrame(S32 s32ChnId, VideoFrameInfo *pstFrameInfo, U32 u32TimeoutMs);
 
 /**
  * @brief  Release a decoded frame back to the decoder.

@@ -32,7 +32,7 @@ extern "C" {
 
 #define MPP_SHM_NAME "/mpp_ctrl"
 #define MPP_SHM_MAGIC 0x4D505053 /* "MPPS" */
-#define MPP_SHM_VERSION 2
+#define MPP_SHM_VERSION 4
 
 #define MPP_MAX_POOL 16
 #define MPP_MAX_BLK 256 /* per pool */
@@ -51,12 +51,14 @@ typedef struct _VbBlockShm {
     U32 pool_id;
     U32 blk_idx;
     atomic_int ref_cnt;
+    atomic_int usr_ref_cnt[MPP_ID_MAX]; /* references grouped by release-responsible module */
     U32 state;    /* VbBlkState */
     U64 phy_addr; /* real CMA physical address */
     U32 size;
     U64 pts;
     U32 next_free;             /* free-list linkage, 0xFFFFFFFF = end */
-    U32 exported;              /* export flag */
+    atomic_uint exported;      /* export flag */
+    atomic_ullong export_token; /* generation-safe opaque token, valid while exported */
     pid_t owner_pid;           /* PID of allocating process */
     int owner_fd;              /* dma-buf fd in owner's fd table */
     U32 frame_info_set;        /* per-buffer metadata snapshot valid */
@@ -78,6 +80,7 @@ typedef struct _VbPoolShm {
     U32 free_cnt;
     U32 used_cnt;
     U32 min_free;
+    U64 next_export_generation; /* protected by lock; preserved across pool reuse */
     U32 frame_info_set;
     VideoFrameInfo frame_info;
     VbBlockShm blocks[MPP_MAX_BLK];
@@ -187,9 +190,20 @@ S32 mpp_shm_init(void);
 
 /**
  * @brief Detach from shared memory. Last process also unlinks it.
+ *
+ * The attach-count decrement, the "am I the last process" decision, the
+ * optional last-process cleanup callback and the shm_unlink() are all
+ * performed while holding the cross-process init lock, so they are atomic
+ * with respect to a concurrent mpp_shm_init(). This closes the race where a
+ * newcomer could attach to a segment that is about to be unlinked.
+ *
+ * @param on_last  Optional callback invoked (with the shared memory still
+ *                 mapped and the init lock held) only when this call detaches
+ *                 the final process, before munmap/unlink. Pass NULL if no
+ *                 last-process cleanup is required.
  * @return 0 on success, negative on failure
  */
-S32 mpp_shm_detach(void);
+S32 mpp_shm_detach(void (*on_last)(MppSharedMem *shm));
 
 /**
  * @brief Get pointer to the shared memory structure.
