@@ -40,7 +40,7 @@ extern "C" {
 #define MPP_MAX_MAP 256
 #define MPP_CHAN_DEPTH 64                    /* ring buffer depth per bind */
 #define MPP_STREAM_CHAN_DEPTH 16             /* stream queue depth per bind (lightweight) */
-#define MPP_STREAM_MAX_PAYLOAD (1024 * 1024) /* max single stream packet size */
+#define MPP_STREAM_MAX_PAYLOAD (4 * 1024 * 1024) /* max single stream packet size */
 
 /* ======================== VB Block (shared) ======================== */
 
