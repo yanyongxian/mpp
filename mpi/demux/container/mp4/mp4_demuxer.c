@@ -253,10 +253,13 @@ static S32 parse_stsd(Mp4Demuxer *pDemux, TrackInfo *pTrack, const U8 *pData, U3
     if (u32EntrySize < 86 || u32EntrySize > u32Size - 8)
         return -1;
 
+    /* Width and height belong to every visual sample entry, not only AVC and
+     * HEVC. Preserve them for MJPEG carried in an MP4V-tagged track too. */
+    pTrack->u32Width = read_be16(pEntry + 24 + 8);
+    pTrack->u32Height = read_be16(pEntry + 26 + 8);
+
     if (u32EntryType == BOX_AVC1) {
         pTrack->eCodec = DEMUX_CODEC_H264;
-        pTrack->u32Width = read_be16(pEntry + 24 + 8); /* +8 for visual sample entry header */
-        pTrack->u32Height = read_be16(pEntry + 26 + 8);
 
         /* Find avcC box */
         const U8 *p = pEntry + 78 + 8; /* skip visual sample entry header */
@@ -283,8 +286,6 @@ static S32 parse_stsd(Mp4Demuxer *pDemux, TrackInfo *pTrack, const U8 *pData, U3
         }
     } else if (u32EntryType == BOX_HVC1 || u32EntryType == BOX_HEV1) {
         pTrack->eCodec = DEMUX_CODEC_H265;
-        pTrack->u32Width = read_be16(pEntry + 24 + 8);
-        pTrack->u32Height = read_be16(pEntry + 26 + 8);
 
         /* Find hvcC box */
         const U8 *p = pEntry + 78 + 8;
@@ -558,7 +559,19 @@ static S32 parse_trak_box(Mp4Demuxer *pDemux, TrackInfo *pTrack, const U8 *pData
                 if (mdiaBoxSize < 8 || mdiaOff + mdiaBoxSize > boxDataSize)
                     break;
 
-                if (mdiaBoxType == BOX_MINF) {
+                if (mdiaBoxType == BOX_MDHD) {
+                    const U8 *pMdhd = pBox + mdiaOff + 8;
+                    U32 mdhdSize = mdiaBoxSize - 8;
+                    U8 version = mdhdSize > 0 ? pMdhd[0] : 0xff;
+
+                    if (version == 0 && mdhdSize >= 20) {
+                        pTrack->u32Timescale = read_be32(pMdhd + 12);
+                        pTrack->u64Duration = read_be32(pMdhd + 16);
+                    } else if (version == 1 && mdhdSize >= 32) {
+                        pTrack->u32Timescale = read_be32(pMdhd + 20);
+                        pTrack->u64Duration = read_be64(pMdhd + 24);
+                    }
+                } else if (mdiaBoxType == BOX_MINF) {
                     const U8 *pMinf = pBox + mdiaOff + 8;
                     U32 minfSize = mdiaBoxSize - 8;
 
@@ -742,10 +755,16 @@ S32 Mp4Demuxer_GetStreamInfo(Mp4Demuxer *pDemux, DemuxStreamInfo *pstInfo) {
     if (!pDemux || !pstInfo)
         return ERR_DEMUX_NULL_PTR;
 
-    pstInfo->eCodecType = pDemux->stVideoTrack.eCodec;
-    pstInfo->u32Width = pDemux->stVideoTrack.u32Width;
-    pstInfo->u32Height = pDemux->stVideoTrack.u32Height;
-    pstInfo->u32Fps = 25; /* TODO: Calculate from timescale/duration */
+    TrackInfo *pTrack = &pDemux->stVideoTrack;
+    pstInfo->eCodecType = pTrack->eCodec;
+    pstInfo->u32Width = pTrack->u32Width;
+    pstInfo->u32Height = pTrack->u32Height;
+    if (pTrack->u32Timescale > 0 && pTrack->u64Duration > 0 && pTrack->u32SampleCount > 0) {
+        U64 numerator = (U64)pTrack->u32SampleCount * pTrack->u32Timescale;
+        pstInfo->u32Fps = (U32)((numerator + pTrack->u64Duration / 2) / pTrack->u64Duration);
+    } else {
+        pstInfo->u32Fps = 25;
+    }
 
     return 0;
 }
@@ -761,6 +780,11 @@ S32 Mp4Demuxer_ReadPacket(Mp4Demuxer *pDemux, DemuxPacket *pstPkt) {
     }
 
     SampleEntry *pSample = &pTrack->pstSamples[pTrack->u32CurrentSample];
+    U64 frameIntervalUs = 40000;
+    if (pTrack->u32Timescale > 0 && pTrack->u64Duration > 0 && pTrack->u32SampleCount > 0) {
+        frameIntervalUs =
+            pTrack->u64Duration * 1000000ULL / ((U64)pTrack->u32Timescale * pTrack->u32SampleCount);
+    }
 
     /* Seek and read raw AVCC sample */
     fseeko(pDemux->pFile, (off_t)pSample->u64Offset, SEEK_SET);
@@ -771,6 +795,22 @@ S32 Mp4Demuxer_ReadPacket(Mp4Demuxer *pDemux, DemuxPacket *pstPkt) {
 
     if (fread(pDemux->au8ReadBuf, 1, pSample->u32Size, pDemux->pFile) != pSample->u32Size) {
         return ERR_DEMUX_NO_STREAM;
+    }
+
+    /* MJPEG samples are complete JPEG bitstreams. FFmpeg commonly tags this
+     * MP4 track as mp4v, so identify it by the JPEG SOI marker and bypass the
+     * AVCC-to-Annex-B conversion that would otherwise emit an empty packet. */
+    if (pSample->u32Size >= 2 && pDemux->au8ReadBuf[0] == 0xff && pDemux->au8ReadBuf[1] == 0xd8) {
+        pTrack->eCodec = DEMUX_CODEC_MJPEG;
+        pstPkt->pu8Data = pDemux->au8ReadBuf;
+        pstPkt->u32Size = pSample->u32Size;
+        pstPkt->bKeyFrame = MPP_TRUE;
+        pstPkt->eCodecType = DEMUX_CODEC_MJPEG;
+        pstPkt->u32Width = pTrack->u32Width;
+        pstPkt->u32Height = pTrack->u32Height;
+        pstPkt->u64PTS = (U64)pTrack->u32CurrentSample * frameIntervalUs;
+        pTrack->u32CurrentSample++;
+        return 0;
     }
 
     /* Convert AVCC (length-prefixed) to Annex-B (start-code-prefixed).
@@ -813,7 +853,7 @@ S32 Mp4Demuxer_ReadPacket(Mp4Demuxer *pDemux, DemuxPacket *pstPkt) {
     pstPkt->eCodecType = pTrack->eCodec;
     pstPkt->u32Width = pTrack->u32Width;
     pstPkt->u32Height = pTrack->u32Height;
-    pstPkt->u64PTS = (U64)pTrack->u32CurrentSample * 40000; /* 25fps approx */
+    pstPkt->u64PTS = (U64)pTrack->u32CurrentSample * frameIntervalUs;
 
     /* Debug: dump first 3 packets */
     if (pTrack->u32CurrentSample < 3) {
@@ -847,11 +887,14 @@ S32 Mp4Demuxer_Seek(Mp4Demuxer *pDemux, S64 s64PtsUs) {
         return 0;
     }
 
-    /* Current MP4 parser uses 25fps approximate PTS in ReadPacket. Keep seek
-     * timestamp mapping consistent with that until full stts/ctts timing is
-     * implemented. Always seek backward to the closest sync sample so decoder
-     * receives an IDR before dependent frames. */
-    u32TargetSample = (U32)(s64PtsUs / 40000);
+    U64 frameIntervalUs = 40000;
+    if (pTrack->u32Timescale > 0 && pTrack->u64Duration > 0 && pTrack->u32SampleCount > 0) {
+        frameIntervalUs =
+            pTrack->u64Duration * 1000000ULL / ((U64)pTrack->u32Timescale * pTrack->u32SampleCount);
+    }
+    if (frameIntervalUs == 0)
+        frameIntervalUs = 1;
+    u32TargetSample = (U32)((U64)s64PtsUs / frameIntervalUs);
     if (u32TargetSample >= pTrack->u32SampleCount) {
         u32TargetSample = pTrack->u32SampleCount - 1;
     }

@@ -62,6 +62,15 @@ target_include_directories(test_mux_common PRIVATE ${MPP_INCLUDE_DIRS}
 target_link_libraries(test_mux_common PRIVATE mpp)
 add_test(NAME test_mux_common COMMAND $<TARGET_FILE:test_mux_common>)
 
+add_executable(test_mux_socket_disconnect
+    test_mux_socket_disconnect.c
+    ${CMAKE_SOURCE_DIR}/mpi/mux/mux_socket.c)
+target_compile_definitions(test_mux_socket_disconnect PRIVATE ${MPP_TEST_COMMON_DEFS})
+target_include_directories(test_mux_socket_disconnect PRIVATE
+    ${MPP_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/mpi/mux)
+add_test(NAME test_mux_socket_disconnect COMMAND $<TARGET_FILE:test_mux_socket_disconnect>)
+
 add_executable(test_uvc test_uvc.c)
 target_compile_definitions(test_uvc PRIVATE ${MPP_TEST_COMMON_DEFS})
 target_link_libraries(test_uvc PRIVATE mpp)
@@ -103,6 +112,36 @@ target_link_libraries(test_vdec PRIVATE mpp)
 target_include_directories(test_vdec PRIVATE ${MPP_INCLUDE_DIRS}
     "${CMAKE_CURRENT_SOURCE_DIR}/vdec/include")
 add_test(NAME test_vdec COMMAND $<TARGET_FILE:test_vdec> --test api)
+
+add_executable(test_vdec_input_retry
+    test_vdec_input_retry.c
+    ${CMAKE_SOURCE_DIR}/mpi/vdec/vdec_input_retry.c)
+target_compile_definitions(test_vdec_input_retry PRIVATE ${MPP_TEST_COMMON_DEFS})
+target_include_directories(test_vdec_input_retry PRIVATE
+    ${MPP_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/utils/include
+    ${CMAKE_SOURCE_DIR}/mpi/vdec)
+add_test(NAME test_vdec_input_retry COMMAND $<TARGET_FILE:test_vdec_input_retry>)
+
+# Hardware-only regression; intentionally not registered with CTest.
+add_executable(test_vdec_backpressure vdec/test_vdec_backpressure.c)
+target_compile_definitions(test_vdec_backpressure PRIVATE ${MPP_TEST_COMMON_DEFS})
+target_link_libraries(test_vdec_backpressure PRIVATE mpp)
+target_include_directories(test_vdec_backpressure PRIVATE ${MPP_INCLUDE_DIRS})
+
+add_executable(test_mjpeg_zero_dri
+    vdec/test_mjpeg_zero_dri.c
+    ${CMAKE_SOURCE_DIR}/al/vcodec/linlonv5v7/linlonv5v7_mjpeg.c)
+target_include_directories(test_mjpeg_zero_dri PRIVATE
+    ${CMAKE_SOURCE_DIR}/al/vcodec/linlonv5v7/include)
+add_test(NAME test_mjpeg_zero_dri COMMAND $<TARGET_FILE:test_mjpeg_zero_dri>)
+
+# Hardware-only regression; intentionally not registered with CTest.
+add_executable(test_vdec_resolution_change vdec/test_vdec_resolution_change.c ${TEST_VDEC_PARSE_SRCS})
+target_compile_definitions(test_vdec_resolution_change PRIVATE ${MPP_TEST_COMMON_DEFS})
+target_link_libraries(test_vdec_resolution_change PRIVATE mpp)
+target_include_directories(test_vdec_resolution_change PRIVATE ${MPP_INCLUDE_DIRS}
+    "${CMAKE_CURRENT_SOURCE_DIR}/vdec/include")
 
 # Demo executables
 add_executable(test_v2d test_v2d.c)
